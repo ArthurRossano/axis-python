@@ -80,9 +80,6 @@ class AxisCameraBarcodeScannerApp:
         self.start_button = ttk.Button(control_frame, text="Iniciar Leitura", command=self.toggle_scanning, state="disabled")
         self.start_button.pack(side="left", padx=5)
         
-        self.test_button = ttk.Button(control_frame, text="Testar Conexão", command=self.test_connection)
-        self.test_button.pack(side="left", padx=5)
-        
         self.export_button = ttk.Button(control_frame, text="Exportar Relatório", command=self.export_report)
         self.export_button.pack(side="left", padx=5)
         
@@ -382,24 +379,21 @@ class AxisCameraBarcodeScannerApp:
                 return
             ts = time.strftime("%Y%m%d-%H%M%S")
             base = dir_path or os.getcwd()
-            summary_path = os.path.join(base, f"axis_codes_summary_{ts}.csv")
-            detail_path = os.path.join(base, f"axis_codes_detalhado_{ts}.csv")
-            with open(summary_path, "w", newline="", encoding="utf-8") as fsum:
-                wsum = csv.writer(fsum)
-                wsum.writerow(["data", "type", "count", "first_seen", "last_seen"])
-                for data, st in self.code_stats.items():
-                    first_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st["first_seen"]))
-                    last_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st["last_seen"]))
-                    wsum.writerow([data, st["type"], st["count"], first_str, last_str])
-            with open(detail_path, "w", newline="", encoding="utf-8") as fdet:
-                wdet = csv.writer(fdet)
-                wdet.writerow(["timestamp", "type", "data"])
+            # Gerar apenas o relatório detalhado conforme solicitado
+            report_path = os.path.join(base, f"axis_codes_{ts}.csv")
+            
+            with open(report_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["Data", "Horário", "Código", "Quantidade"])
                 for rec in self.scanned_records:
-                    ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(rec["timestamp"]))
-                    wdet.writerow([ts_str, rec["type"], rec["data"]])
-            self.update_result(f"Relatório salvo: {summary_path}")
-            self.update_result(f"Relatório detalhado salvo: {detail_path}")
-            self.update_status("Relatórios gerados com sucesso")
+                    local_time = time.localtime(rec["timestamp"])
+                    date_str = time.strftime("%d/%m/%Y", local_time)
+                    time_str = time.strftime("%H:%M:%S", local_time)
+                    count = self.code_stats[rec["data"]]["count"]
+                    writer.writerow([date_str, time_str, rec["data"], count])
+            
+            self.update_result(f"Relatório salvo: {report_path}")
+            self.update_status("Relatório gerado com sucesso")
         except Exception as e:
             try:
                 self.update_status(f"Erro ao gerar relatórios: {str(e)}")
@@ -462,40 +456,6 @@ class AxisCameraBarcodeScannerApp:
         except Exception as e:
             logger.error(f"Erro ao converter imagem: {e}")
             return None
-    
-    def test_connection(self):
-        """Testa a conexão com a câmera via RTSP"""
-        self.camera_ip = self.ip_entry.get()
-        self.camera_username = self.username_entry.get()
-        self.camera_password = self.password_entry.get()
-
-        if not all([self.camera_ip, self.camera_username, self.camera_password]):
-            self.update_status("Preencha todos os campos de configuração da câmera")
-            return
-
-        self.update_status("Testando conexão RTSP com a câmera...")
-
-        try:
-            rtsp_url = self.build_rtsp_url()
-            cap = cv2.VideoCapture(rtsp_url)
-            if cap.isOpened():
-                ret, frame = cap.read()
-                if ret and frame is not None:
-                    h, w = frame.shape[:2]
-                    self.update_status("Conexão RTSP bem-sucedida!")
-                    self.update_result(f"Teste RTSP OK - Resolução: {w}x{h}")
-                else:
-                    self.update_status("Conectado, mas não retornou frame")
-            else:
-                self.update_status("Falha ao conectar via RTSP")
-        except Exception as e:
-            self.update_status(f"Erro de conexão RTSP: {str(e)}")
-        finally:
-            try:
-                if 'cap' in locals() and cap.isOpened():
-                    cap.release()
-            except Exception:
-                pass
     
     def update_status(self, message):
         """Atualiza a barra de status"""
