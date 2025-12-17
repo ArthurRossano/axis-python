@@ -30,7 +30,8 @@ class AxisCameraBarcodeScannerApp:
         self.camera_ip = ""
         self.camera_username = ""
         self.camera_password = ""
-        self.scanning = False
+        self.connected = False  # Estado da conexão RTSP
+        self.scanning = False   # Estado da leitura de códigos
         self.last_code = None
         self.last_scan_time = 0
         self.scan_cooldown = 30  # segundos entre leituras para evitar duplicatas
@@ -64,11 +65,19 @@ class AxisCameraBarcodeScannerApp:
         self.password_entry = ttk.Entry(config_frame, width=30, show="*")
         self.password_entry.grid(row=2, column=1, padx=5, pady=5)
         
+        ttk.Label(config_frame, text="Intervalo (s):").grid(row=3, column=0, padx=5, pady=5, sticky="w")
+        self.interval_entry = ttk.Entry(config_frame, width=30)
+        self.interval_entry.grid(row=3, column=1, padx=5, pady=5)
+        self.interval_entry.insert(0, "30")  # Intervalo padrão
+        
         # Botões de controle
         control_frame = ttk.Frame(self.root)
         control_frame.pack(fill="x", padx=10, pady=5)
         
-        self.start_button = ttk.Button(control_frame, text="Iniciar Leitura", command=self.toggle_scanning)
+        self.connect_button = ttk.Button(control_frame, text="Conectar Câmera", command=self.toggle_connection)
+        self.connect_button.pack(side="left", padx=5)
+
+        self.start_button = ttk.Button(control_frame, text="Iniciar Leitura", command=self.toggle_scanning, state="disabled")
         self.start_button.pack(side="left", padx=5)
         
         self.test_button = ttk.Button(control_frame, text="Testar Conexão", command=self.test_connection)
@@ -100,9 +109,9 @@ class AxisCameraBarcodeScannerApp:
         self.status_bar = ttk.Label(self.root, textvariable=self.status_var, relief="sunken", anchor="w")
         self.status_bar.pack(side="bottom", fill="x")
     
-    def toggle_scanning(self):
-        if not self.scanning:
-            # Iniciar escaneamento
+    def toggle_connection(self):
+        if not self.connected:
+            # Conectar
             self.camera_ip = self.ip_entry.get()
             self.camera_username = self.username_entry.get()
             self.camera_password = self.password_entry.get()
@@ -110,96 +119,136 @@ class AxisCameraBarcodeScannerApp:
             if not all([self.camera_ip, self.camera_username, self.camera_password]):
                 self.update_status("Preencha todos os campos de configuração da câmera")
                 return
-            
-            # Abrir stream RTSP
+
             self.open_rtsp_stream()
-
+            
             if self.cap is not None and self.cap.isOpened():
-                self.scanning = True
-                self.start_button.config(text="Parar Leitura")
-                self.update_status("Leitura via RTSP iniciada...")
-                self.code_last_seen.clear()
-                self.code_last_emitted.clear()
-                self.code_stats.clear()
-                self.scanned_records.clear()
-
-                # Iniciar thread de escaneamento
-                self.scan_thread = threading.Thread(target=self.scan_loop)
-                self.scan_thread.daemon = True
-                self.scan_thread.start()
+                self.connected = True
+                self.connect_button.config(text="Desconectar Câmera")
+                self.start_button.config(state="normal")
+                self.update_status("Conectado à câmera. Visualização iniciada.")
+                
+                # Iniciar thread de vídeo
+                self.video_thread = threading.Thread(target=self.video_loop)
+                self.video_thread.daemon = True
+                self.video_thread.start()
             else:
-                self.update_status("Falha ao abrir stream RTSP")
+                self.update_status("Falha ao conectar à câmera")
         else:
-            # Parar escaneamento
+            # Desconectar
+            self.connected = False
             self.scanning = False
-            self.start_button.config(text="Iniciar Leitura")
-            self.update_status("Leitura interrompida")
-            # Liberar o stream
+            self.connect_button.config(text="Conectar Câmera")
+            self.start_button.config(text="Iniciar Leitura", state="disabled")
+            self.update_status("Desconectado da câmera")
+            
+            # Liberar recursos
             try:
                 if self.cap is not None and self.cap.isOpened():
                     self.cap.release()
             except Exception:
                 pass
+            self.camera_canvas.delete("all")
 
-                
+    def toggle_scanning(self):
+        if not self.connected:
+            self.update_status("É necessário conectar à câmera primeiro")
+            return
+
+        if not self.scanning:
+            # Iniciar escaneamento (apenas ativa a flag de processamento)
+            try:
+                interval_val = float(self.interval_entry.get())
+                if interval_val < 0:
+                    raise ValueError
+                self.scan_cooldown = interval_val
+            except ValueError:
+                self.update_status("Intervalo inválido. Deve ser um número positivo.")
+                return
+
+            self.scanning = True
+            self.start_button.config(text="Parar Leitura")
+            self.update_status("Leitura de códigos iniciada...")
+            
+            # Resetar contadores se necessário ou manter histórico? 
+            # Geralmente reiniciar sessão de leitura limpa cache recente, mas mantém histórico.
+            # Vamos limpar apenas last_seen para permitir releitura imediata se cooldown permitir
+            self.code_last_seen.clear()
+            self.code_last_emitted.clear()
+            
+        else:
+            # Parar escaneamento
+            self.scanning = False
+            self.start_button.config(text="Iniciar Leitura")
+            self.update_status("Leitura de códigos pausada (visualização ativa)")
     
-    def scan_loop(self):
-        while self.scanning:
+    def video_loop(self):
+        while self.connected:
             try:
                 # Capturar frame do stream RTSP
                 frame = self.capture_frame()
                 if frame is not None:
-                    # Processar a imagem para encontrar códigos
-                    codes = self.decode_barcodes(frame)
-
-                    # Desenhar retângulos e textos sobre os códigos encontrados
-                    annotated = self.draw_barcodes(frame.copy(), codes)
-
-                    # Atualizar a visualização da imagem na interface
-                    self.update_camera_view(annotated)
-                    # Lógica de deduplicação: reemitir após cooldown, mesmo visível
-                    current_time = time.time()
-                    if codes:
-                        # Mapear códigos visíveis no frame atual
-                        visible_codes = {}
-                        for code in codes:
-                            try:
-                                data = code.data.decode('utf-8')
-                            except Exception:
-                                data = str(code.data)
-                            visible_codes[data] = code.type
-
-                        # Atualizar last_seen e emitir respeitando cooldown por código
-                        for data, ctype in visible_codes.items():
-                            self.code_last_seen[data] = current_time
-
-                            last_emit = self.code_last_emitted.get(data, 0)
-                            if (current_time - last_emit) > self.scan_cooldown:
-                                # Emite (novo ou após cooldown)
-                                self.code_last_emitted[data] = current_time
-                                self.last_code = data
-                                self.last_scan_time = current_time
-                                self.root.after(0, self.update_result, f"Tipo: {ctype}, Dados: {data}")
-                                self.root.after(0, self.update_status, f"Código {ctype} detectado!")
-                                try:
-                                    self.record_scan(data, ctype, current_time)
-                                except Exception:
-                                    pass
-
-                        # Limpeza: remover códigos não vistos há muito tempo para liberar memória
-                        for data in list(self.code_last_seen.keys()):
-                            last_seen = self.code_last_seen.get(data, 0)
-                            if (current_time - last_seen) > (self.scan_cooldown * 2):
-                                self.code_last_seen.pop(data, None)
-                                self.code_last_emitted.pop(data, None)
+                    # Se estiver escaneando, processa o frame
+                    if self.scanning:
+                        # Processar a imagem para encontrar códigos
+                        codes = self.decode_barcodes(frame)
+                        # Desenhar retângulos e textos sobre os códigos encontrados
+                        annotated = self.draw_barcodes(frame.copy(), codes)
+                        # Atualizar a visualização com anotações
+                        self.update_camera_view(annotated)
+                        
+                        # Lógica de processamento dos códigos encontrados
+                        self.process_codes(codes)
+                    else:
+                        # Apenas visualização, sem processamento pesado
+                        self.update_camera_view(frame)
+                else:
+                    # Se falhar frame, talvez desconexão momentânea?
+                    pass
                 
                 # Pequena pausa para não sobrecarregar a CPU
-                time.sleep(0.05)  # Reduzido para melhorar a fluidez da visualização
+                time.sleep(0.05)
                 
             except Exception as e:
-                logger.error(f"Erro durante o escaneamento: {e}")
-                self.root.after(0, self.update_status, f"Erro: {str(e)}")
-                time.sleep(2)  # Pausa antes de tentar novamente
+                logger.error(f"Erro no loop de vídeo: {e}")
+                time.sleep(1)
+
+    def process_codes(self, codes):
+        current_time = time.time()
+        if codes:
+            # Mapear códigos visíveis no frame atual
+            visible_codes = {}
+            for code in codes:
+                try:
+                    data = code.data.decode('utf-8')
+                except Exception:
+                    data = str(code.data)
+                visible_codes[data] = code.type
+
+            # Atualizar last_seen e emitir respeitando cooldown por código
+            for data, ctype in visible_codes.items():
+                self.code_last_seen[data] = current_time
+
+                last_emit = self.code_last_emitted.get(data, 0)
+                if (current_time - last_emit) > self.scan_cooldown:
+                    # Emite (novo ou após cooldown)
+                    self.code_last_emitted[data] = current_time
+                    self.last_code = data
+                    self.last_scan_time = current_time
+                    self.root.after(0, self.update_result, f"Tipo: {ctype}, Dados: {data}")
+                    self.root.after(0, self.update_status, f"Código {ctype} detectado!")
+                    try:
+                        self.record_scan(data, ctype, current_time)
+                    except Exception:
+                        pass
+
+            # Limpeza: remover códigos não vistos há muito tempo
+            for data in list(self.code_last_seen.keys()):
+                last_seen = self.code_last_seen.get(data, 0)
+                if (current_time - last_seen) > (self.scan_cooldown * 2):
+                    self.code_last_seen.pop(data, None)
+                    self.code_last_emitted.pop(data, None)
+
                 
     def update_camera_view(self, image):
         """Atualiza a visualização da câmera no canvas mantendo a proporção e exibindo o frame inteiro"""
