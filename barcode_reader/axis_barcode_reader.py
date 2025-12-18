@@ -43,6 +43,9 @@ class AxisCameraBarcodeScannerApp:
         self.code_last_emitted = {}   # mapa: codigo -> último timestamp emitido
         self.code_stats = {}
         self.scanned_records = []
+        self.live_report_path = None
+        self.live_report_file = None
+        self.live_report_writer = None
         
         self.setup_ui()
     
@@ -100,6 +103,24 @@ class AxisCameraBarcodeScannerApp:
         self.result_text = scrolledtext.ScrolledText(result_frame, wrap=tk.WORD, height=10)
         self.result_text.pack(fill="both", expand=True, padx=5, pady=5)
         
+        live_frame = ttk.LabelFrame(self.root, text="Leituras (tempo real)")
+        live_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        self.live_tree = ttk.Treeview(live_frame, columns=("Data", "Horário", "Código", "Quantidade"), show="headings")
+        self.live_tree.heading("Data", text="Data")
+        self.live_tree.heading("Horário", text="Horário")
+        self.live_tree.heading("Código", text="Código")
+        self.live_tree.heading("Quantidade", text="Quantidade")
+        self.live_tree.column("Data", width=100, anchor="center")
+        self.live_tree.column("Horário", width=90, anchor="center")
+        self.live_tree.column("Código", width=300, anchor="w")
+        self.live_tree.column("Quantidade", width=100, anchor="center")
+        self.live_tree.pack(side="left", fill="both", expand=True, padx=5, pady=5)
+        
+        live_scroll = ttk.Scrollbar(live_frame, orient="vertical", command=self.live_tree.yview)
+        self.live_tree.configure(yscrollcommand=live_scroll.set)
+        live_scroll.pack(side="right", fill="y")
+        
         # Status bar
         self.status_var = tk.StringVar()
         self.status_var.set("Pronto")
@@ -138,6 +159,7 @@ class AxisCameraBarcodeScannerApp:
             self.connect_button.config(text="Conectar Câmera")
             self.start_button.config(text="Iniciar Leitura", state="disabled")
             self.update_status("Desconectado da câmera")
+            self.stop_live_report()
             
             # Liberar recursos
             try:
@@ -172,12 +194,15 @@ class AxisCameraBarcodeScannerApp:
             # Vamos limpar apenas last_seen para permitir releitura imediata se cooldown permitir
             self.code_last_seen.clear()
             self.code_last_emitted.clear()
+            self.start_live_report()
+            self.clear_live_view()
             
         else:
             # Parar escaneamento
             self.scanning = False
             self.start_button.config(text="Iniciar Leitura")
             self.update_status("Leitura de códigos pausada (visualização ativa)")
+            self.stop_live_report()
     
     def video_loop(self):
         while self.connected:
@@ -371,6 +396,10 @@ class AxisCameraBarcodeScannerApp:
                 st["count"] += 1
         except Exception:
             pass
+        try:
+            self.append_live_record(data, ts)
+        except Exception:
+            pass
 
     def generate_report(self, dir_path=None):
         try:
@@ -399,6 +428,82 @@ class AxisCameraBarcodeScannerApp:
                 self.update_status(f"Erro ao gerar relatórios: {str(e)}")
             except Exception:
                 pass
+    
+    def start_live_report(self, dir_path=None):
+        try:
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            base = dir_path or os.getcwd()
+            self.live_report_path = os.path.join(base, f"axis_codes_live_{ts}.csv")
+            self.live_report_file = open(self.live_report_path, "w", newline="", encoding="utf-8")
+            self.live_report_writer = csv.writer(self.live_report_file)
+            self.live_report_writer.writerow(["Data", "Horário", "Código", "Quantidade"])
+            try:
+                self.live_report_file.flush()
+                os.fsync(self.live_report_file.fileno())
+            except Exception:
+                pass
+            self.update_result(f"Relatório em tempo real: {self.live_report_path}")
+            self.update_status("Relatório atualizado a cada leitura")
+        except Exception as e:
+            self.live_report_path = None
+            self.live_report_file = None
+            self.live_report_writer = None
+            try:
+                self.update_status(f"Erro ao iniciar relatório: {str(e)}")
+            except Exception:
+                pass
+    
+    def stop_live_report(self):
+        try:
+            if self.live_report_file:
+                try:
+                    self.live_report_file.flush()
+                    os.fsync(self.live_report_file.fileno())
+                except Exception:
+                    pass
+                self.live_report_file.close()
+        except Exception:
+            pass
+        self.live_report_file = None
+        self.live_report_writer = None
+        self.live_report_path = None
+    
+    def append_live_record(self, data, ts):
+        try:
+            if self.live_report_writer:
+                local_time = time.localtime(ts)
+                date_str = time.strftime("%d/%m/%Y", local_time)
+                time_str = time.strftime("%H:%M:%S", local_time)
+                count = self.code_stats.get(data, {}).get("count", 1)
+                self.live_report_writer.writerow([date_str, time_str, data, count])
+                try:
+                    self.live_report_file.flush()
+                    os.fsync(self.live_report_file.fileno())
+                except Exception:
+                    pass
+                try:
+                    self.root.after(0, self.update_live_view, data, ts)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    
+    def clear_live_view(self):
+        try:
+            for i in self.live_tree.get_children():
+                self.live_tree.delete(i)
+        except Exception:
+            pass
+    
+    def update_live_view(self, data, ts):
+        try:
+            local_time = time.localtime(ts)
+            date_str = time.strftime("%d/%m/%Y", local_time)
+            time_str = time.strftime("%H:%M:%S", local_time)
+            count = self.code_stats.get(data, {}).get("count", 1)
+            self.live_tree.insert("", "end", values=(date_str, time_str, data, count))
+        except Exception:
+            pass
 
     def export_report(self):
         try:
