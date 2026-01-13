@@ -38,6 +38,12 @@ class AxisCameraBarcodeScannerApp:
         self.current_image = None  # Para armazenar a imagem atual
         self.current_frame_cv = None  # Para armazenar o último frame OpenCV
         self.cap = None  # RTSP VideoCapture
+        
+        # Variáveis para controle de thread de captura (baixa latência)
+        self.frame_lock = threading.Lock()
+        self.new_frame_event = threading.Event()
+        self.latest_frame = None
+        
         # Controle de duplicidade por código (tempo e presença)
         self.code_last_seen = {}      # mapa: codigo -> último timestamp visto
         self.code_last_emitted = {}   # mapa: codigo -> último timestamp emitido
@@ -146,7 +152,12 @@ class AxisCameraBarcodeScannerApp:
                 self.start_button.config(state="normal")
                 self.update_status("Conectado à câmera. Visualização iniciada.")
                 
-                # Iniciar thread de vídeo
+                # Iniciar thread de captura (buffer cleaning) para baixa latência
+                self.capture_thread = threading.Thread(target=self.capture_loop)
+                self.capture_thread.daemon = True
+                self.capture_thread.start()
+
+                # Iniciar thread de vídeo (processamento e display)
                 self.video_thread = threading.Thread(target=self.video_loop)
                 self.video_thread.daemon = True
                 self.video_thread.start()
@@ -204,11 +215,30 @@ class AxisCameraBarcodeScannerApp:
             self.update_status("Leitura de códigos pausada (visualização ativa)")
             self.stop_live_report()
     
+    def capture_loop(self):
+        """Loop dedicado para ler frames o mais rápido possível e manter buffer vazio"""
+        while self.connected:
+            try:
+                if self.cap is not None and self.cap.isOpened():
+                    ret, frame = self.cap.read()
+                    if ret:
+                        with self.frame_lock:
+                            self.latest_frame = frame
+                        self.new_frame_event.set()
+                    else:
+                        time.sleep(0.01)
+                else:
+                    time.sleep(0.1)
+            except Exception as e:
+                logger.error(f"Erro no loop de captura: {e}")
+                time.sleep(0.1)
+
     def video_loop(self):
         while self.connected:
             try:
-                # Capturar frame do stream RTSP
+                # Capturar frame do stream RTSP (agora sincronizado com evento de nova imagem)
                 frame = self.capture_frame()
+                
                 if frame is not None:
                     # Se estiver escaneando, processa o frame
                     if self.scanning:
@@ -225,11 +255,10 @@ class AxisCameraBarcodeScannerApp:
                         # Apenas visualização, sem processamento pesado
                         self.update_camera_view(frame)
                 else:
-                    # Se falhar frame, talvez desconexão momentânea?
+                    # Se não houver frame novo (timeout), loop continua
                     pass
                 
-                # Pequena pausa para não sobrecarregar a CPU
-                time.sleep(0.05)
+                # Sem sleep fixo aqui, pois o ritmo é ditado pelo capture_frame (wait)
                 
             except Exception as e:
                 logger.error(f"Erro no loop de vídeo: {e}")
@@ -345,6 +374,13 @@ class AxisCameraBarcodeScannerApp:
         try:
             rtsp_url = self.build_rtsp_url()
             self.cap = cv2.VideoCapture(rtsp_url)
+            
+            # Otimização para baixa latência: buffer pequeno
+            try:
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+                
             if self.cap.isOpened():
                 self.update_status("Stream RTSP aberto com sucesso")
             else:
@@ -354,14 +390,16 @@ class AxisCameraBarcodeScannerApp:
             self.update_status(f"Erro ao abrir RTSP: {str(e)}")
 
     def capture_frame(self):
-        """Captura um frame do stream RTSP"""
+        """Captura o frame mais recente da thread de captura"""
         try:
-            if self.cap is not None and self.cap.isOpened():
-                ret, frame = self.cap.read()
-                if ret:
-                    return frame
+            # Espera por um novo frame (com timeout para não travar a UI se a câmera cair)
+            if self.new_frame_event.wait(timeout=0.2):
+                self.new_frame_event.clear()
+                with self.frame_lock:
+                    if self.latest_frame is not None:
+                        return self.latest_frame
         except Exception as e:
-            logger.error(f"Erro ao capturar frame RTSP: {e}")
+            logger.error(f"Erro ao recuperar frame do buffer: {e}")
         return None
     
     def decode_barcodes(self, image):
