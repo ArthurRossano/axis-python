@@ -1,3 +1,5 @@
 pyzbar
 opencv-python
 pillow
+openpyxl
+requests

@@ -15,6 +15,9 @@ os.environ.setdefault("ZBAR_DEBUG", "0")
 from pyzbar.pyzbar import decode
 from urllib.parse import quote
 import csv
+from openpyxl import Workbook
+import requests
+from requests.auth import HTTPDigestAuth
 
 # Configuração de logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -43,6 +46,10 @@ class AxisCameraBarcodeScannerApp:
         self.frame_lock = threading.Lock()
         self.new_frame_event = threading.Event()
         self.latest_frame = None
+        
+        # Controle de Zoom (API)
+        self.zoom_level = 0
+        self.zoom_timer = None
         
         # Controle de duplicidade por código (tempo e presença)
         self.code_last_seen = {}      # mapa: codigo -> último timestamp visto
@@ -92,9 +99,35 @@ class AxisCameraBarcodeScannerApp:
         self.export_button = ttk.Button(control_frame, text="Exportar Relatório", command=self.export_report)
         self.export_button.pack(side="left", padx=5)
         
-        # Área de visualização
-        view_frame = ttk.LabelFrame(self.root, text="Visualização")
-        view_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        # Controle de Zoom
+        ttk.Label(control_frame, text="Zoom (API):").pack(side="left", padx=(10, 2))
+        self.zoom_scale = tk.Scale(control_frame, from_=1, to=9999, resolution=100, orient="horizontal", length=150, command=self.on_zoom_slide)
+        self.zoom_scale.set(1)
+        self.zoom_scale.pack(side="left", padx=5)
+        
+        # Controle de Foco Manual
+        ttk.Label(control_frame, text="Foco:").pack(side="left", padx=(10, 2))
+        self.focus_scale = tk.Scale(control_frame, from_=1, to=9999, resolution=100, orient="horizontal", length=150, command=self.on_focus_slide)
+        self.focus_scale.set(1)
+        self.focus_scale.pack(side="left", padx=5)
+        self.focus_timer = None
+
+        self.autofocus_button = ttk.Button(control_frame, text="Autofoco", command=self.trigger_autofocus)
+        self.autofocus_button.pack(side="left", padx=5)
+
+        # Checkbox para controlar visualização (Economia de CPU)
+        self.show_video_var = tk.BooleanVar(value=True)
+        self.show_video_check = ttk.Checkbutton(control_frame, text="Exibir Vídeo", variable=self.show_video_var)
+        self.show_video_check.pack(side="left", padx=5)
+        
+        # --- Layout Principal dividido em 2 painéis (Horizontal) ---
+        main_pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        main_pane.pack(fill="both", expand=True, padx=10, pady=5)
+
+        # === LADO ESQUERDO: Câmera ===
+        view_frame = ttk.LabelFrame(main_pane, text="Visualização da Câmera")
+        # Adiciona ao painel esquerdo
+        main_pane.add(view_frame, weight=1)
         
         # Canvas para exibir a imagem da câmera
         self.camera_canvas = tk.Canvas(view_frame, bg="black")
@@ -102,30 +135,38 @@ class AxisCameraBarcodeScannerApp:
         # Atualiza a imagem quando o canvas é redimensionado
         self.camera_canvas.bind('<Configure>', self.on_canvas_resize)
         
-        # Área para exibir resultados
-        result_frame = ttk.LabelFrame(self.root, text="Resultados")
-        result_frame.pack(fill="both", expand=True, padx=10, pady=10)
-        
-        self.result_text = scrolledtext.ScrolledText(result_frame, wrap=tk.WORD, height=10)
-        self.result_text.pack(fill="both", expand=True, padx=5, pady=5)
-        
-        live_frame = ttk.LabelFrame(self.root, text="Leituras (tempo real)")
-        live_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        # === LADO DIREITO: Dados (Tabela + Log) ===
+        right_frame = ttk.Frame(main_pane)
+        main_pane.add(right_frame, weight=1)
+
+        # 1. Tabela de Leituras (Topo do lado direito, maior destaque)
+        live_frame = ttk.LabelFrame(right_frame, text="Leituras (tempo real)")
+        live_frame.pack(fill="both", expand=True, padx=0, pady=0)
         
         self.live_tree = ttk.Treeview(live_frame, columns=("Data", "Horário", "Código", "Quantidade"), show="headings")
         self.live_tree.heading("Data", text="Data")
         self.live_tree.heading("Horário", text="Horário")
         self.live_tree.heading("Código", text="Código")
-        self.live_tree.heading("Quantidade", text="Quantidade")
-        self.live_tree.column("Data", width=100, anchor="center")
-        self.live_tree.column("Horário", width=90, anchor="center")
-        self.live_tree.column("Código", width=300, anchor="w")
-        self.live_tree.column("Quantidade", width=100, anchor="center")
+        self.live_tree.heading("Quantidade", text="Qtd")
+        
+        # Ajuste de larguras para caber melhor na meia tela
+        self.live_tree.column("Data", width=80, anchor="center")
+        self.live_tree.column("Horário", width=70, anchor="center")
+        self.live_tree.column("Código", width=150, anchor="w")
+        self.live_tree.column("Quantidade", width=50, anchor="center")
+        
         self.live_tree.pack(side="left", fill="both", expand=True, padx=5, pady=5)
         
         live_scroll = ttk.Scrollbar(live_frame, orient="vertical", command=self.live_tree.yview)
         self.live_tree.configure(yscrollcommand=live_scroll.set)
         live_scroll.pack(side="right", fill="y")
+
+        # 2. Log de Resultados (Base do lado direito, menor destaque)
+        result_frame = ttk.LabelFrame(right_frame, text="Log de Eventos")
+        result_frame.pack(fill="x", expand=False, padx=0, pady=10)
+        
+        self.result_text = scrolledtext.ScrolledText(result_frame, wrap=tk.WORD, height=8)
+        self.result_text.pack(fill="both", expand=True, padx=5, pady=5)
         
         # Status bar
         self.status_var = tk.StringVar()
@@ -161,6 +202,9 @@ class AxisCameraBarcodeScannerApp:
                 self.video_thread = threading.Thread(target=self.video_loop)
                 self.video_thread.daemon = True
                 self.video_thread.start()
+                
+                # Verificar suporte PTZ e limites
+                self.check_ptz_support()
             else:
                 self.update_status("Falha ao conectar à câmera")
         else:
@@ -215,6 +259,197 @@ class AxisCameraBarcodeScannerApp:
             self.update_status("Leitura de códigos pausada (visualização ativa)")
             self.stop_live_report()
     
+    def on_zoom_slide(self, val):
+        """Callback do slider de zoom - usa timer para debounce"""
+        if self.zoom_timer:
+            self.root.after_cancel(self.zoom_timer)
+        self.zoom_timer = self.root.after(200, lambda: self.send_zoom_command(val))
+
+    def on_focus_slide(self, val):
+        """Callback do slider de foco - usa timer para debounce"""
+        if self.focus_timer:
+            self.root.after_cancel(self.focus_timer)
+        self.focus_timer = self.root.after(200, lambda: self.send_focus_command(val))
+
+    def check_ptz_support(self):
+        """Verifica suporte a PTZ e obtém limites de zoom"""
+        def _check():
+            try:
+                ip = self.camera_ip
+                if ":" in ip:
+                    ip = ip.split(":")[0]
+                
+                # 1. Verificar INFO geral
+                url_info = f"http://{ip}/axis-cgi/com/ptz.cgi"
+                params_info = {'info': 1, 'camera': 1}
+                auth = HTTPDigestAuth(self.camera_username, self.camera_password)
+                
+                resp = requests.get(url_info, params=params_info, auth=auth, timeout=3)
+                logger.info(f"Resposta PTZ info (status {resp.status_code}): {resp.text.strip()}")
+                
+                if resp.status_code == 200 and "PTZ disabled" not in resp.text:
+                    # 2. Consultar LIMITES (MinZoom, MaxZoom)
+                    params_limits = {'query': 'limits', 'camera': 1}
+                    resp_lim = requests.get(url_info, params=params_limits, auth=auth, timeout=3)
+                    
+                    if resp_lim.status_code == 200:
+                        logger.info(f"Limites PTZ: {resp_lim.text.strip()}")
+                        # Tentar parsear MinZoom e MaxZoom
+                        min_z = 1
+                        max_z = 9999
+                        for line in resp_lim.text.splitlines():
+                            if "MinZoom" in line:
+                                try: min_z = int(line.split("=")[1])
+                                except: pass
+                            if "MaxZoom" in line:
+                                try: max_z = int(line.split("=")[1])
+                                except: pass
+                        
+                        # Atualizar slider na thread principal
+                        self.root.after(0, self.update_zoom_slider_range, min_z, max_z)
+                        self.root.after(0, lambda: self.status_var.set(f"PTZ Ativo. Zoom: {min_z}-{max_z}"))
+                        
+                        # Diagnóstico extra: Verificar se é Digital ou Óptico
+                        try:
+                            url_param = f"http://{ip}/axis-cgi/param.cgi"
+                            params_props = {'action': 'list', 'group': 'Properties.PTZ'}
+                            resp_props = requests.get(url_param, params=params_props, auth=auth, timeout=3)
+                            if resp_props.status_code == 200:
+                                props = resp_props.text
+                                logger.info(f"Hardware PTZ Info: {props.strip()}")
+                                is_digital = "DigitalZoom=yes" in props or "DigitalPTZ=yes" in props
+                                is_optical = "OpticalZoom=yes" in props
+                                
+                                status_msg = f"PTZ Ativo. Zoom: {min_z}-{max_z}"
+                                if is_digital and not is_optical:
+                                    status_msg += " (Digital)"
+                                elif is_optical:
+                                    status_msg += " (Óptico)"
+                                
+                                self.root.after(0, lambda: self.status_var.set(status_msg))
+                        except Exception as e:
+                            logger.warning(f"Não foi possível verificar tipo de zoom: {e}")
+
+                    else:
+                        self.root.after(0, lambda: self.status_var.set("PTZ Ativo (Limites desconhecidos)"))
+                else:
+                    self.root.after(0, lambda: self.status_var.set("PTZ desabilitado ou restrito na câmera"))
+
+            except Exception as e:
+                logger.error(f"Erro ao checar PTZ: {e}")
+                
+        threading.Thread(target=_check, daemon=True).start()
+
+    def update_zoom_slider_range(self, min_z, max_z):
+        try:
+            self.zoom_scale.config(from_=min_z, to=max_z)
+            logger.info(f"Slider de zoom ajustado para {min_z} - {max_z}")
+        except Exception as e:
+            logger.error(f"Erro ao atualizar slider: {e}")
+
+    def send_zoom_command(self, val):
+        """Envia comando de zoom para a câmera via API VAPIX"""
+        if not self.connected:
+            return
+
+        def _request():
+            try:
+                ip = self.camera_ip
+                if ":" in ip:
+                    ip = ip.split(":")[0]
+
+                url = f"http://{ip}/axis-cgi/com/ptz.cgi"
+                params = {"zoom": int(float(val)), "camera": 1}
+                auth = HTTPDigestAuth(self.camera_username, self.camera_password)
+                response = requests.get(url, params=params, auth=auth, timeout=5)
+                
+                # 200 = OK com corpo, 204 = OK sem corpo (sucesso)
+                if response.status_code in [200, 204]:
+                    logger.info(f"Zoom definido para {val}. Status: {response.status_code}")
+                else:
+                    logger.warning(f"Falha ao definir zoom. Status: {response.status_code}, Msg: {response.text}")
+            except Exception as e:
+                logger.error(f"Erro ao enviar comando de zoom: {e}")
+
+        threading.Thread(target=_request, daemon=True).start()
+
+    def send_focus_command(self, val):
+        """Envia comando de foco manual para a câmera"""
+        if not self.connected:
+            return
+        
+        def _request():
+            try:
+                ip = self.camera_ip
+                if ":" in ip: ip = ip.split(":")[0]
+                url = f"http://{ip}/axis-cgi/com/ptz.cgi"
+                
+                # Primeiro desabilita autofocus para permitir manual
+                auth = HTTPDigestAuth(self.camera_username, self.camera_password)
+                requests.get(url, params={"autofocus": "off", "camera": 1}, auth=auth, timeout=3)
+                
+                # Envia valor de foco
+                params = {"focus": int(float(val)), "camera": 1}
+                response = requests.get(url, params=params, auth=auth, timeout=5)
+                
+                if response.status_code in [200, 204]:
+                    logger.info(f"Foco manual definido para {val}. Status: {response.status_code}")
+                else:
+                    logger.warning(f"Falha ao definir foco. Status: {response.status_code}, Msg: {response.text}")
+            except Exception as e:
+                logger.error(f"Erro ao enviar comando de foco: {e}")
+        
+        threading.Thread(target=_request, daemon=True).start()
+
+    def trigger_autofocus(self):
+        """Aciona o autofoco da câmera via API VAPIX (Toggle Off/On para forçar)"""
+        if not self.connected:
+            self.update_status("Conecte a câmera primeiro.")
+            return
+
+        self.update_status("Tentando realizar autofoco...")
+        
+        def _request():
+            try:
+                ip = self.camera_ip
+                if ":" in ip:
+                    ip = ip.split(":")[0]
+
+                url = f"http://{ip}/axis-cgi/com/ptz.cgi"
+                auth = HTTPDigestAuth(self.camera_username, self.camera_password)
+                
+                # 1. Tenta desabilitar primeiro (Toggle strategy)
+                logger.info("Enviando comando: autofocus=off")
+                requests.get(url, params={"autofocus": "off", "camera": 1}, auth=auth, timeout=5)
+                time.sleep(0.5)
+                
+                # 2. Habilita autofocus
+                logger.info("Enviando comando: autofocus=on")
+                params = {"autofocus": "on", "camera": 1}
+                response = requests.get(url, params=params, auth=auth, timeout=10)
+                
+                if response.status_code in [200, 204]:
+                    logger.info(f"Autofoco acionado com sucesso. Status: {response.status_code}")
+                    self.root.after(0, lambda: self.update_status("Autofoco realizado com sucesso!"))
+                else:
+                    # Fallback: tentar focus=auto (algumas câmeras antigas/específicas)
+                    logger.warning(f"Autofoco padrão falhou ({response.status_code}). Tentando método alternativo...")
+                    params_alt = {"focus": "auto", "camera": 1}
+                    resp_alt = requests.get(url, params=params_alt, auth=auth, timeout=10)
+                    
+                    if resp_alt.status_code in [200, 204]:
+                        logger.info(f"Autofoco alternativo sucesso. Status: {resp_alt.status_code}")
+                        self.root.after(0, lambda: self.update_status("Autofoco realizado (método alt)!"))
+                    else:
+                        logger.warning(f"Falha no autofoco. Msg: {response.text}")
+                        self.root.after(0, lambda: self.update_status("Câmera não suporta autofoco remoto ou falhou."))
+                        
+            except Exception as e:
+                logger.error(f"Erro ao enviar comando de autofoco: {e}")
+                self.root.after(0, lambda: self.update_status(f"Erro no autofoco: {e}"))
+
+        threading.Thread(target=_request, daemon=True).start()
+
     def capture_loop(self):
         """Loop dedicado para ler frames o mais rápido possível e manter buffer vazio"""
         while self.connected:
@@ -247,13 +482,15 @@ class AxisCameraBarcodeScannerApp:
                         # Desenhar retângulos e textos sobre os códigos encontrados
                         annotated = self.draw_barcodes(frame.copy(), codes)
                         # Atualizar a visualização com anotações
-                        self.update_camera_view(annotated)
+                        if self.show_video_var.get():
+                            self.update_camera_view(annotated)
                         
                         # Lógica de processamento dos códigos encontrados
                         self.process_codes(codes)
                     else:
                         # Apenas visualização, sem processamento pesado
-                        self.update_camera_view(frame)
+                        if self.show_video_var.get():
+                            self.update_camera_view(frame)
                 else:
                     # Se não houver frame novo (timeout), loop continua
                     pass
@@ -370,9 +607,34 @@ class AxisCameraBarcodeScannerApp:
         return f"rtsp://{username_enc}:{password_enc}@{host}/axis-media/media.amp"
 
     def open_rtsp_stream(self):
-        """Abre o stream RTSP com OpenCV"""
+        """Abre o stream RTSP da câmera"""
         try:
-            rtsp_url = self.build_rtsp_url()
+            # Tratamento robusto de IP:Porta para RTSP
+            ip_raw = self.camera_ip
+            port_part = ""
+            ip_clean = ip_raw
+            
+            if ":" in ip_raw:
+                parts = ip_raw.split(":")
+                # Se for apenas IP:Porta (ex: 192.168.0.90:554)
+                if len(parts) == 2:
+                    ip_clean = parts[0]
+                    port_part = f":{parts[1]}"
+            
+            # Montar URL RTSP corretamente
+            # rtsp://IP:PORT/axis-media/media.amp?camera=1
+            # Credenciais serão passadas de forma codificada para evitar problemas com caracteres especiais
+            
+            from urllib.parse import quote
+            safe_user = quote(self.camera_username)
+            safe_pass = quote(self.camera_password)
+            
+            rtsp_url = f"rtsp://{safe_user}:{safe_pass}@{ip_clean}{port_part}/axis-media/media.amp?camera=1"
+            
+            logger.info(f"Tentando abrir RTSP: {rtsp_url.replace(safe_pass, '******')}")
+            
+            # Opções para reduzir latência e forçar TCP
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
             self.cap = cv2.VideoCapture(rtsp_url)
             
             # Otimização para baixa latência: buffer pequeno
@@ -447,17 +709,21 @@ class AxisCameraBarcodeScannerApp:
             ts = time.strftime("%Y%m%d-%H%M%S")
             base = dir_path or os.getcwd()
             # Gerar apenas o relatório detalhado conforme solicitado
-            report_path = os.path.join(base, f"axis_codes_{ts}.csv")
+            report_path = os.path.join(base, f"axis_codes_{ts}.xlsx")
             
-            with open(report_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(["Data", "Horário", "Código", "Quantidade"])
-                for rec in self.scanned_records:
-                    local_time = time.localtime(rec["timestamp"])
-                    date_str = time.strftime("%d/%m/%Y", local_time)
-                    time_str = time.strftime("%H:%M:%S", local_time)
-                    count = self.code_stats[rec["data"]]["count"]
-                    writer.writerow([date_str, time_str, rec["data"], count])
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Relatório de Leituras"
+            
+            ws.append(["Data", "Horário", "Código", "Quantidade"])
+            for rec in self.scanned_records:
+                local_time = time.localtime(rec["timestamp"])
+                date_str = time.strftime("%d/%m/%Y", local_time)
+                time_str = time.strftime("%H:%M:%S", local_time)
+                count = self.code_stats[rec["data"]]["count"]
+                ws.append([date_str, time_str, rec["data"], count])
+            
+            wb.save(report_path)
             
             self.update_result(f"Relatório salvo: {report_path}")
             self.update_status("Relatório gerado com sucesso")
